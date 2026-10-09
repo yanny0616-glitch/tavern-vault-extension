@@ -2,7 +2,7 @@
 // 作用：1) 全屏内嵌藏馆网页；2) 作为桥，替藏馆页面读写酒馆本地数据（角色卡、世界书、预设、正则、快速回复、主题、背景）
 
 const EXT_KEY = 'tavernVault';
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const DEFAULTS = { url: '', token: '', fab: true, fabPos: null };
 const isTT = () => Boolean(window.__TAURITAVERN__);
 
@@ -91,7 +91,36 @@ async function backgroundList() {
 const jsonFile = (name, obj) => ({ filename: `${String(name).replace(/[\\/:*?"<>|]/g, '_')}.json`, data: new TextEncoder().encode(JSON.stringify(obj, null, 2)).buffer });
 
 const handlers = {
-    hello: async () => ({ host: isTT() ? 'TauriTavern' : 'SillyTavern', version: VERSION, features: ['raw', 'replace'] }),
+    hello: async () => ({ host: isTT() ? 'TauriTavern' : 'SillyTavern', version: VERSION, features: ['raw', 'replace', 'theme', 'insets'] }),
+
+    /** 藏馆告诉插件当前风格的颜色：面板顶部（状态栏那一条）和标题栏跟着变，不再是固定的深色 */
+    async theme({ bg, fg, line } = {}) {
+        if (!panel) return { ok: false };
+        const color = (v) => (typeof v === 'string' && v.length < 80 && /^[#a-z0-9(),.%\s/-]+$/i.test(v) ? v : '');
+        const set = (k, v) => { if (color(v)) panel.style.setProperty(k, v); else panel.style.removeProperty(k); };
+        set('--tv-bg', bg);
+        set('--tv-fg', fg);
+        set('--tv-line', line);
+        return { ok: true };
+    },
+
+    /**
+     * 全屏：面板不再留边距、隐藏自己的标题栏，藏馆铺满整个屏幕；
+     * 灵动岛 / 状态栏、底部 Home 条、横屏两侧的安全区高度交给藏馆自己留
+     */
+    async insets() {
+        if (!panel) return { top: 0, bottom: 0, left: 0, right: 0 };
+        const measure = (side) => {
+            const probe = document.createElement('div');
+            probe.style.cssText = `position:fixed;left:0;top:0;width:0;visibility:hidden;pointer-events:none;height:var(--tt-inset-${side}, env(safe-area-inset-${side}, 0px))`;
+            panel.append(probe);
+            const v = Math.round(probe.getBoundingClientRect().height);
+            probe.remove();
+            return v;
+        };
+        panel.classList.add('tv-edge');
+        return { top: measure('top'), bottom: measure('bottom'), left: measure('left'), right: measure('right') };
+    },
 
     /** 返回酒馆里条目的原始内容（JSON），藏馆用它计算内容指纹，判断两边是否一致 */
     async raw({ kind, ids = [] }) {
@@ -378,6 +407,7 @@ async function openPanel() {
         const r = await fetch(`${baseUrl()}/api/health`, { cache: 'no-store' });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
     } catch (e) {
+        panel.classList.remove('tv-edge'); // 连不上时要显示插件自己的标题栏（有关闭按钮）
         panel.classList.add('error');
         panel.querySelector('.tv-error-msg').innerHTML = `无法连接藏馆服务：${e.message}<br><small>请检查地址是否正确、服务是否在运行。iOS 版 TauriTavern 请使用 https 地址。</small>`;
         return;

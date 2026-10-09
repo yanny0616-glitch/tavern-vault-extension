@@ -1,0 +1,11 @@
+{
+    "display_name": "TavernVault 酒馆藏馆",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "TavernVault",
+    "version": "1.0.0",
+    "homePage": ""
+}

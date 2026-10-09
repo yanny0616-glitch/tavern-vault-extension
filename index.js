@@ -2,7 +2,7 @@
 // 作用：1) 全屏内嵌藏馆网页；2) 作为桥，替藏馆页面读写酒馆本地数据（角色卡、世界书、预设、正则、快速回复、主题、背景）
 
 const EXT_KEY = 'tavernVault';
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const DEFAULTS = { url: '', token: '', fab: true, fabPos: null };
 const isTT = () => Boolean(window.__TAURITAVERN__);
 
@@ -91,7 +91,52 @@ async function backgroundList() {
 const jsonFile = (name, obj) => ({ filename: `${String(name).replace(/[\\/:*?"<>|]/g, '_')}.json`, data: new TextEncoder().encode(JSON.stringify(obj, null, 2)).buffer });
 
 const handlers = {
-    hello: async () => ({ host: isTT() ? 'TauriTavern' : 'SillyTavern', version: VERSION }),
+    hello: async () => ({ host: isTT() ? 'TauriTavern' : 'SillyTavern', version: VERSION, features: ['raw', 'replace'] }),
+
+    /** 返回酒馆里条目的原始内容（JSON），藏馆用它计算内容指纹，判断两边是否一致 */
+    async raw({ kind, ids = [] }) {
+        const c = ctx();
+        const out = [];
+        const pool = async (list, fn, n = 4) => {
+            let i = 0;
+            await Promise.all(Array.from({ length: Math.min(n, list.length) }, async () => {
+                while (i < list.length) {
+                    const id = list[i++];
+                    try { const data = await fn(id); if (data) out.push({ id, data }); } catch { /* 单个失败不影响其它 */ }
+                }
+            }));
+        };
+        switch (kind) {
+            case 'character':
+                await pool(ids, async (id) => {
+                    const ch = (c.characters || []).find((x) => x.avatar === id);
+                    const parse = (x) => { if (x && typeof x.json_data === 'string') { try { return JSON.parse(x.json_data); } catch { /* ignore */ } } return x; };
+                    if (ch && !ch.shallow) return parse(ch);
+                    return parse(await (await stPost('/api/characters/get', { avatar_url: id })).json());
+                });
+                break;
+            case 'worldbook':
+                await pool(ids, async (id) => (await stPost('/api/worldinfo/get', { name: id })).json());
+                break;
+            case 'preset': {
+                const all = presetEntries(await stSettings(true));
+                for (const id of ids) { const p = all.find((x) => x.id === id); if (p) out.push({ id, data: p.data }); }
+                break;
+            }
+            case 'regex':
+                for (const id of ids) { const r = (c.extensionSettings?.regex || []).find((x) => x.id === id); if (r) out.push({ id, data: r }); }
+                break;
+            case 'quickreply': case 'theme': {
+                const s = await stSettings(true);
+                const list = kind === 'theme' ? s.themes || [] : s.quickReplyPresets || [];
+                for (const id of ids) { const x = list.find((y) => y?.name === id); if (x) out.push({ id, data: x }); }
+                break;
+            }
+            default:
+                break;
+        }
+        return out;
+    },
 
     async list({ kind }) {
         const c = ctx();
@@ -175,62 +220,100 @@ const handlers = {
         }
     },
 
-    async import({ kind, filename, name, apiId, data }) {
+    /**
+     * 导入到酒馆
+     * replace：要覆盖的酒馆条目 id（角色卡头像文件名、世界书名、预设 id、正则 id……）
+     * asNew：和已有条目重名时另存一份（自动加编号）
+     */
+    async import({ kind, filename, name, apiId, data, replace = '', asNew = false }) {
         const c = ctx();
         const file = new File([data], filename || 'file');
-        const parseJson = () => JSON.parse(new TextDecoder().decode(data).replace(/^﻿/, ''));
+        const parseJson = () => JSON.parse(new TextDecoder().decode(data).replace(/^\uFEFF/, ''));
+        const clean = (n) => String(n || '').replace(/[\\/:*?"<>|]/g, '_');
+        const unique = (n, taken) => {
+            const set = new Set(taken);
+            if (!set.has(n)) return n;
+            let i = 2;
+            while (set.has(`${n} (${i})`)) i++;
+            return `${n} (${i})`;
+        };
         switch (kind) {
             case 'character': {
                 const ext = (filename.split('.').pop() || 'png').toLowerCase();
-                await stUpload('/api/characters/import', file, { file_type: ext });
+                await stUpload('/api/characters/import', file, replace ? { file_type: ext, preserved_name: replace } : { file_type: ext });
                 try { await c.getCharacters?.(); } catch { /* ignore */ }
-                return { message: '已导入角色卡' };
+                return { message: replace ? '已覆盖酒馆里的角色卡（聊天记录保留）' : '已导入角色卡' };
             }
             case 'worldbook': {
-                const n = (name || filename.replace(/\.json$/i, '')).replace(/[\\/:*?"<>|]/g, '_');
+                let n = clean(name || filename.replace(/\.json$/i, ''));
+                if (replace) n = replace;
+                else if (asNew) n = unique(n, (await stSettings(true)).world_names || []);
                 await stUpload('/api/worldinfo/import', new File([data], `${n}.json`, { type: 'application/json' }));
                 try { (await import('/scripts/world-info.js')).updateWorldInfoList?.(); } catch { /* ignore */ }
-                return { message: `已导入世界书「${n}」` };
+                settingsCache = null;
+                return { message: `${replace ? '已覆盖' : '已导入'}世界书「${n}」` };
             }
             case 'preset': {
                 const obj = parseJson();
-                const id = apiId || 'openai';
-                const n = obj.name || name || filename.replace(/\.json$/i, '');
+                let id = apiId || 'openai';
+                let n = obj.name || name || filename.replace(/\.json$/i, '');
+                if (replace) [id, n] = [replace.split('::')[0], replace.split('::').slice(1).join('::')];
+                else if (asNew) n = unique(n, presetEntries(await stSettings(true)).filter((p) => p.apiId === id).map((p) => p.name));
+                if ('name' in obj) obj.name = n;
                 await stPost('/api/presets/save', { apiId: id, name: n, preset: obj });
                 settingsCache = null;
-                return { message: `已保存预设「${n}」，刷新酒馆后在预设列表中可见` };
+                return { message: `已${replace ? '覆盖' : '保存'}预设「${n}」，刷新酒馆后在预设列表中可见` };
             }
             case 'regex': {
                 const obj = parseJson();
                 const list = Array.isArray(obj) ? obj : [obj];
                 c.extensionSettings.regex ??= [];
+                const all = c.extensionSettings.regex;
+                const newId = () => crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+                if (replace && list.length === 1) {
+                    const idx = all.findIndex((x) => x.id === replace);
+                    if (idx >= 0) {
+                        all[idx] = { ...list[0], id: replace, disabled: all[idx].disabled };
+                        save();
+                        return { message: `已覆盖正则「${all[idx].scriptName}」，刷新后生效` };
+                    }
+                }
                 let added = 0;
                 for (const r of list) {
-                    const exists = c.extensionSettings.regex.some((x) => x.scriptName === r.scriptName && x.findRegex === r.findRegex);
-                    if (exists) continue;
-                    c.extensionSettings.regex.push({ ...r, id: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}` });
+                    if (!asNew && all.some((x) => x.scriptName === r.scriptName && x.findRegex === r.findRegex)) continue;
+                    const scriptName = asNew ? unique(r.scriptName || '正则', all.map((x) => x.scriptName)) : r.scriptName;
+                    all.push({ ...r, scriptName, id: newId() });
                     added++;
                 }
                 save();
                 return { message: `已添加 ${added} 条全局正则${added < list.length ? `（${list.length - added} 条已存在）` : ''}，刷新后在正则面板可见` };
             }
-            case 'quickreply': {
+            case 'quickreply': case 'theme': {
                 const obj = parseJson();
                 obj.name ||= name;
-                await stPost('/api/quick-replies/save', obj);
+                if (replace) obj.name = replace;
+                else if (asNew) {
+                    const s = await stSettings(true);
+                    obj.name = unique(obj.name, (kind === 'theme' ? s.themes || [] : s.quickReplyPresets || []).map((x) => x?.name));
+                }
+                await stPost(kind === 'theme' ? '/api/themes/save' : '/api/quick-replies/save', obj);
                 settingsCache = null;
-                return { message: `已保存快速回复「${obj.name}」，刷新后可见` };
+                return { message: `已${replace ? '覆盖' : '保存'}${kind === 'theme' ? '主题' : '快速回复'}「${obj.name}」，刷新后可见` };
             }
-            case 'theme': {
-                const obj = parseJson();
-                obj.name ||= name;
-                await stPost('/api/themes/save', obj);
-                settingsCache = null;
-                return { message: `已保存主题「${obj.name}」，刷新后可在主题列表选择` };
+            case 'background': {
+                let fname = filename;
+                if (replace) fname = replace;
+                else if (asNew) {
+                    const dot = filename.lastIndexOf('.');
+                    const stem = dot > 0 ? filename.slice(0, dot) : filename;
+                    const ext = dot > 0 ? filename.slice(dot) : '';
+                    const taken = new Set(await backgroundList());
+                    let i = 2;
+                    while (taken.has(fname)) fname = `${stem} (${i++})${ext}`;
+                }
+                await stUpload('/api/backgrounds/upload', new File([data], fname));
+                return { message: replace ? '已覆盖背景' : '已上传背景' };
             }
-            case 'background':
-                await stUpload('/api/backgrounds/upload', file);
-                return { message: '已上传背景' };
             default:
                 throw new Error(`酒馆不支持直接导入该类型：${kind}`);
         }
@@ -242,6 +325,15 @@ let panel;
 let iframe;
 let loadedSrc = '';
 
+const SVG = (d, size = 18) => `<svg class="tv-ic" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+const IC = {
+    archive: '<rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/>',
+    refresh: '<path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/>',
+    x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+    wifiOff: '<path d="M12 20h.01"/><path d="M8.5 16.43a5 5 0 0 1 7 0"/><path d="M2 8.82a15 15 0 0 1 4.17-2.65"/><path d="M10.66 5c4.01-.36 8.14.9 11.34 3.76"/><path d="M16.85 11.25a10 10 0 0 1 2.22 1.68"/><path d="M5 13a10 10 0 0 1 5.24-2.76"/><path d="m2 2 20 20"/>',
+    link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+};
+
 function vaultOrigin() {
     try { return new URL(baseUrl()).origin; } catch { return ''; }
 }
@@ -251,12 +343,12 @@ function buildPanel() {
     panel.id = 'tv-panel';
     panel.innerHTML = `
         <div class="tv-bar">
-            <span class="tv-title">📦 酒馆藏馆</span>
-            <button type="button" data-act="reload" title="刷新">↻</button>
-            <button type="button" data-act="close" title="关闭">✕</button>
+            <span class="tv-title">${SVG(IC.archive, 17)}<span>酒馆藏馆</span></span>
+            <button type="button" data-act="reload" title="刷新">${SVG(IC.refresh)}</button>
+            <button type="button" data-act="close" title="关闭">${SVG(IC.x)}</button>
         </div>
         <iframe allow="clipboard-write; clipboard-read; fullscreen" referrerpolicy="no-referrer"></iframe>
-        <div class="tv-error"><div style="font-size:42px">📡</div><div class="tv-error-msg"></div>
+        <div class="tv-error"><div class="tv-error-ic">${SVG(IC.wifiOff, 40)}</div><div class="tv-error-msg"></div>
             <button type="button" class="menu_button" data-act="retry">重试</button></div>`;
     document.body.append(panel);
     iframe = panel.querySelector('iframe');
@@ -334,7 +426,7 @@ function renderFab() {
     fab.id = 'tv-fab';
     fab.type = 'button';
     fab.title = '酒馆藏馆';
-    fab.textContent = '📦';
+    fab.innerHTML = SVG(IC.archive, 24);
     const pos = settings().fabPos;
     if (pos) { fab.style.left = `${pos.x}px`; fab.style.top = `${pos.y}px`; fab.style.right = 'auto'; fab.style.bottom = 'auto'; }
     let start = null;
@@ -371,15 +463,15 @@ function buildSettings() {
     <div id="tv-settings" class="tv-settings">
       <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-          <b>📦 TavernVault 酒馆藏馆</b>
+          <b>TavernVault 酒馆藏馆</b>
           <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
           <div class="tv-row"><label>服务器</label><input id="tv-url" class="text_pole" type="text" placeholder="https://vault.example.com"></div>
           <div class="tv-row"><label>密码</label><input id="tv-pass" class="text_pole" type="password" placeholder="藏馆访问密码（未设置可留空）"></div>
           <div class="tv-row">
-            <div id="tv-connect" class="menu_button">🔗 连接</div>
-            <div id="tv-open" class="menu_button">📦 打开藏馆</div>
+            <div id="tv-connect" class="menu_button">${SVG(IC.link, 15)} 连接</div>
+            <div id="tv-open" class="menu_button">${SVG(IC.archive, 15)} 打开藏馆</div>
           </div>
           <div id="tv-status" class="tv-status"></div>
           <label class="checkbox_label"><input id="tv-fab-toggle" type="checkbox"> 显示悬浮按钮（可拖动）</label>
@@ -423,9 +515,9 @@ function buildSettings() {
             $('tv-pass').value = '';
             save();
             loadedSrc = '';
-            status(`✅ 已连接：${health.title || '酒馆藏馆'} v${health.version}`, 'ok');
+            status(`已连接：${health.title || '酒馆藏馆'} v${health.version}`, 'ok');
         } catch (e) {
-            status(`❌ ${e.message}`, 'err');
+            status(`连接失败：${e.message}`, 'err');
         }
     });
 }
@@ -437,7 +529,7 @@ function addMenuItem() {
     item.id = 'tv-menu-item';
     item.className = 'list-group-item flex-container flexGap5 interactable';
     item.tabIndex = 0;
-    item.innerHTML = '<span>📦</span><span>酒馆藏馆</span>';
+    item.innerHTML = `<span class="tv-menu-ic">${SVG(IC.archive, 16)}</span><span>酒馆藏馆</span>`;
     item.addEventListener('click', openPanel);
     menu.append(item);
 }
